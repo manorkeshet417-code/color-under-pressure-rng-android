@@ -1,0 +1,92 @@
+name: Build Android APK
+
+# Builds Color Under Pressure: RNG for Android with Buildozer (python-for-android + pygame),
+# signs it with the fixed key in the CUP_SIGNING secret ("<password>:<base64 of the .p12>")
+# so new builds install over the old one, and publishes it as a release to download on the phone.
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 17
+
+      - name: Build tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends autoconf automake libtool pkg-config zlib1g-dev libncurses5-dev libncursesw5-dev libtinfo5 libffi-dev libssl-dev cmake unzip zip lld
+          pip install --upgrade pip
+          pip install "buildozer==1.5.0" "cython==0.29.37"
+
+      # the SDK, NDK and compiled recipes take long the first time: keep them between builds
+      - uses: actions/cache@v4
+        with:
+          path: ~/.buildozer
+          key: buildozer-sdk-${{ hashFiles('buildozer.spec') }}
+          restore-keys: buildozer-sdk-
+      # the compiled recipes (python, pygame...) are rebuilt whenever the spec or a recipe changes
+      - uses: actions/cache@v4
+        with:
+          path: .buildozer
+          key: buildozer-dist-${{ hashFiles('buildozer.spec', 'recipes/**') }}
+
+      - name: Prepare the game for the phone
+        run: |
+          python tools/patch_game.py app/color_rng.py
+          V=$(grep -m1 -oP '^VERSION\s*=\s*"\K[0-9.]+' app/color_rng.py | cut -d. -f1-3)
+          sed -i "s/^version = .*/version = ${V:-1.1.0}/" buildozer.spec
+          echo "android.numeric_version = $(( 1000 + ${{ github.run_number }} ))" >> buildozer.spec
+          grep -E '^(version|android.numeric_version)' buildozer.spec
+
+      - name: Build APK
+        run: yes | buildozer -v android release
+
+      - name: Sign
+        env:
+          SIGNING: ${{ secrets.CUP_SIGNING }}
+        run: |
+          APK=$(ls bin/*.apk | head -1); echo "built: $APK"
+          BT=$(ls -d ~/.buildozer/android/platform/android-sdk/build-tools/* | sort -V | tail -1)
+          "$BT/zipalign" -f -p 4 "$APK" aligned.apk
+          if [ -n "$SIGNING" ]; then
+            PASS="${SIGNING%%:*}"; printf '%s' "${SIGNING#*:}" | base64 -d > "$RUNNER_TEMP/cup.p12"
+            "$BT/apksigner" sign --ks "$RUNNER_TEMP/cup.p12" --ks-type PKCS12 --ks-pass "pass:$PASS" --key-pass "pass:$PASS" --ks-key-alias cup --out ColorUnderPressureRNG.apk aligned.apk
+          else
+            echo "::warning::No CUP_SIGNING secret: signing with a throwaway debug key (uninstall before updating)"
+            keytool -genkeypair -keystore dbg.jks -storepass android -keypass android -alias dbg -keyalg RSA -keysize 2048 -validity 10000 -dname "CN=debug"
+            "$BT/apksigner" sign --ks dbg.jks --ks-pass pass:android --key-pass pass:android --out ColorUnderPressureRNG.apk aligned.apk
+          fi
+          "$BT/apksigner" verify ColorUnderPressureRNG.apk && ls -la ColorUnderPressureRNG.apk
+          unzip -l ColorUnderPressureRNG.apk | grep -iE 'numpy|_multiarray' | head -5 || true
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ColorUnderPressureRNG-apk
+          path: ColorUnderPressureRNG.apk
+
+      - name: Publish release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: android-${{ github.run_number }}
+          name: Color Under Pressure RNG for Android ${{ github.run_number }}
+          make_latest: true
+          body: |
+            הורדה בטלפון: לחצו על ColorUnderPressureRNG.apk ואז "התקנה".
+            Download on the phone: tap ColorUnderPressureRNG.apk, then Install.
+          files: ColorUnderPressureRNG.apk

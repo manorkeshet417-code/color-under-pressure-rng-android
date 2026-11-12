@@ -1,0 +1,11 @@
+.buildozer/
+bin/
+__pycache__/
+*.pyc
+# never: saves, logs, account backups
+rng_save.json
+*.tmp
+gamedata.json
+account_backup_*.json
+log.txt
+crash.txt
